@@ -1,11 +1,19 @@
 package maintenance
 
 import (
+	"context"
 	"errors"
 	"go-base/internal/domain"
+	"go-base/internal/equipment"
 	"testing"
 	"time"
 )
+
+type vendorDispatchFunc func(context.Context, WorkOrder, equipment.Machine) error
+
+func (fn vendorDispatchFunc) Confirm(ctx context.Context, order WorkOrder, machine equipment.Machine) error {
+	return fn(ctx, order, machine)
+}
 
 func asset(now time.Time) Asset {
 	return Asset{ID: "asset-1", TenantID: "tenant-1", BarnID: "barn-1", Name: "Mixer", Category: "feeder", Status: AssetOperational, MeterHours: 1000, ServiceEvery: 100, LastServiceHour: 950, Version: 1}
@@ -78,5 +86,54 @@ func TestDowntimeMergesOverlapAndClipsWindow(t *testing.T) {
 	total, err := CalculateDowntime(events, window)
 	if err != nil || total != 3*time.Hour {
 		t.Fatalf("total=%v err=%v", total, err)
+	}
+}
+
+func TestExternalDispatchCancellationRestoresEquipmentAndAllowsRetry(t *testing.T) {
+	now := time.Now()
+	order := WorkOrder{ID: "wo-external", TenantID: "tenant-1", AssetID: "machine-1", Status: "open", Version: 4}
+	machine := equipment.Machine{ID: "machine-1", TenantID: "tenant-1", Status: equipment.StatusAvailable, Version: 7, LastServiceAt: now, ServiceInterval: 24 * time.Hour}
+	originalOrder, originalMachine := order, machine
+
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	vendor := vendorDispatchFunc(func(ctx context.Context, _ WorkOrder, _ equipment.Machine) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return errors.New("vendor released by test")
+		}
+	})
+	result := DispatchExternal(ctx, &order, &machine, vendor)
+	<-started
+	cancel()
+
+	timedOut := false
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("dispatch error = %v, want context cancellation", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		timedOut = true
+		close(release)
+		<-result
+	}
+	if order != originalOrder || machine != originalMachine {
+		t.Fatalf("cancelled dispatch retained state: order=%+v machine=%+v", order, machine)
+	}
+
+	success := vendorDispatchFunc(func(context.Context, WorkOrder, equipment.Machine) error { return nil })
+	if err := <-DispatchExternal(context.Background(), &order, &machine, success); err != nil {
+		t.Fatalf("retry dispatch error = %v", err)
+	}
+	if order.Status != "assigned" || order.AssignedTo != "external-vendor" || machine.Status != equipment.StatusMaintenance {
+		t.Fatalf("retry state: order=%+v machine=%+v", order, machine)
+	}
+	if timedOut {
+		t.Fatal("cancelled dispatch did not stop vendor confirmation")
 	}
 }

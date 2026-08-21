@@ -31,6 +31,18 @@ type Reservation struct {
 	Version                         int64
 }
 
+func HoldForMaintenance(machine Machine, orderID string) (Machine, error) {
+	if machine.ID == "" || orderID == "" {
+		return machine, fmt.Errorf("%w: maintenance hold identity", domain.ErrInvalid)
+	}
+	if err := Transition(machine.Status, StatusMaintenance); err != nil {
+		return machine, err
+	}
+	machine.Status = StatusMaintenance
+	machine.Version++
+	return machine, nil
+}
+
 func (m Machine) CanHandle(feedKg float64, at time.Time) error {
 	if m.Status != StatusAvailable && m.Status != StatusReserved {
 		return fmt.Errorf("%w: machine status %s", domain.ErrConflict, m.Status)

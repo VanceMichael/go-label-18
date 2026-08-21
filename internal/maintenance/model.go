@@ -1,12 +1,14 @@
 package maintenance
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"go-base/internal/domain"
+	"go-base/internal/equipment"
 )
 
 type AssetStatus string
@@ -79,6 +81,39 @@ type Downtime struct {
 	StartsAt time.Time
 	EndsAt   time.Time
 	Reason   string
+}
+
+type VendorDispatcher interface {
+	Confirm(context.Context, WorkOrder, equipment.Machine) error
+}
+
+func DispatchExternal(ctx context.Context, order *WorkOrder, machine *equipment.Machine, vendor VendorDispatcher) <-chan error {
+	result := make(chan error, 1)
+	if order == nil || machine == nil || vendor == nil {
+		result <- fmt.Errorf("%w: external dispatch dependencies", domain.ErrInvalid)
+		return result
+	}
+	originalOrder, originalMachine := *order, *machine
+	heldMachine, err := equipment.HoldForMaintenance(*machine, order.ID)
+	if err != nil {
+		result <- err
+		return result
+	}
+	*machine = heldMachine
+	order.Status = "dispatching"
+	order.Version++
+	go func() {
+		if err := vendor.Confirm(context.Background(), *order, *machine); err != nil {
+			*order, *machine = originalOrder, originalMachine
+			result <- fmt.Errorf("confirm external maintenance dispatch: %w", err)
+			return
+		}
+		order.Status = "assigned"
+		order.AssignedTo = "external-vendor"
+		order.Version++
+		result <- nil
+	}()
+	return result
 }
 
 func (a Asset) Validate() error {
